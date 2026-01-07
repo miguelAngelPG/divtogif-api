@@ -26,26 +26,67 @@ app.post('/start', async (req, res) => {
   res.json({ jobId });
 
   (async () => {
-    // Configuración de rutas
     const jobDir = path.join(os.tmpdir(), `job-${jobId}`);
     const framesDir = path.join(jobDir, 'frames');
     const tempHtml = path.join(jobDir, 'input.html');
     const outputGif = path.join(jobDir, 'output.gif');
-    
-    // Archivo basura para que timecut no se queje
-    const dummyOutput = path.join(jobDir, 'dummy.mp4'); 
-
-    const safeFps = parseInt(fps || 30); 
-    const safeWidth = makeEven(parseInt(width || 800));
-    const safeHeight = makeEven(parseInt(height || 400));
-    const safeDuration = parseInt(duration || 3);
-    const safeBg = bg || 'transparent'; 
+    const dummyOutput = path.join(jobDir, 'temp_video.mp4');
 
     try {
       if (!fs.existsSync(jobDir)) fs.mkdirSync(jobDir);
       if (!fs.existsSync(framesDir)) fs.mkdirSync(framesDir);
 
-      // Inyección CSS
+      // ==========================================
+      // 🛡️ ZONA DE SEGURIDAD (LA ADUANA)
+      // ==========================================
+
+      // 1. CONSTANTES DE LÍMITE (Ajustables según tu plan de Railway)
+      const LIMITS = {
+        MAX_WIDTH: 1280,      // Max 720p/HD (Más de esto explota RAM)
+        MAX_HEIGHT: 1280,
+        MAX_DURATION: 20,     // Segundos máximos absolutos
+        MAX_TOTAL_FRAMES: 450 // Presupuesto de fotos (RAM)
+      };
+
+      // 2. SANITIZACIÓN DE INPUTS (Recortes)
+      let rawWidth = parseInt(width || 800);
+      let rawHeight = parseInt(height || 400);
+      let rawDuration = parseInt(duration || 3);
+      let rawFps = parseInt(fps || 30);
+
+      // Aplicamos tijera si se pasan
+      if (rawWidth > LIMITS.MAX_WIDTH) rawWidth = LIMITS.MAX_WIDTH;
+      if (rawHeight > LIMITS.MAX_HEIGHT) rawHeight = LIMITS.MAX_HEIGHT;
+      if (rawDuration > LIMITS.MAX_DURATION) rawDuration = LIMITS.MAX_DURATION;
+
+      // Aseguramos pares para FFmpeg
+      const safeWidth = makeEven(rawWidth);
+      const safeHeight = makeEven(rawHeight);
+      
+      // 3. BALANCEO DE FPS (El algoritmo inteligente)
+      // Si frames totales > 450, bajamos FPS automáticamente
+      let safeFps = rawFps;
+      const totalRequestedFrames = rawDuration * safeFps;
+
+      if (totalRequestedFrames > LIMITS.MAX_TOTAL_FRAMES) {
+        // Regla de tres: NuevosFPS = MaxFrames / Duración
+        safeFps = Math.floor(LIMITS.MAX_TOTAL_FRAMES / rawDuration);
+        // Nunca bajar de 10 FPS (para que no parezca diapositiva)
+        if (safeFps < 10) safeFps = 10; 
+        
+        console.log(`[Job ${jobId}] ⚠️ ALERTA: Ajustando carga. De ${rawFps}fps a ${safeFps}fps.`);
+      }
+
+      // Calculamos los frames finales reales que vamos a generar
+      const expectedFrames = rawDuration * safeFps;
+      const safeBg = bg || 'transparent'; 
+
+      console.log(`[Job ${jobId}] CONFIGURACIÓN FINAL: ${safeWidth}x${safeHeight} | ${rawDuration}s @ ${safeFps}fps | Total: ${expectedFrames} frames`);
+
+      // ==========================================
+      // FIN DE ZONA DE SEGURIDAD
+      // ==========================================
+
       const fullContent = `
         <!DOCTYPE html>
         <html>
@@ -72,68 +113,41 @@ app.post('/start', async (req, res) => {
           const parts = msg.split(' ');
           const frameNum = parseInt(parts[2]);
           if (!isNaN(frameNum)) {
-            const totalFrames = safeDuration * safeFps;
-            const percent = Math.round((frameNum / totalFrames) * 80);
+            const percent = Math.round((frameNum / expectedFrames) * 80);
             sendEvent(jobId, { status: 'processing', progress: percent });
           }
         }
       };
 
-      console.log(`[Job ${jobId}] Iniciando captura Timecut...`);
-
-      // 1. CAPTURA (Sin forzar pattern, dejamos el default)
+      // 4. CAPTURA BLINDADA
       await timecut({
         url: `file://${tempHtml}`,
         viewport: { width: safeWidth, height: safeHeight },
-        duration: safeDuration,
+        duration: rawDuration,
         fps: safeFps,
         tempDir: framesDir,     
-        keepFrames: true,       // OBLIGATORIO
+        keepFrames: true,       
         logger: customLogger,
         launchArguments: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-gpu'],
-        output: dummyOutput,    // Le damos un output dummy para asegurar que termine el proceso bien
+        output: dummyOutput,    
+        screenshotPattern: 'image-%09d.png' 
       });
 
       sendEvent(jobId, { status: 'processing', progress: 85 });
       
-      // 2. DETECTIVE DE ARCHIVOS (Aquí estaba el error antes)
-      console.log(`[Job ${jobId}] Analizando frames generados...`);
-      
+      // 5. VERIFICACIÓN
       let files = [];
       if (fs.existsSync(framesDir)) {
         files = fs.readdirSync(framesDir).filter(f => f.endsWith('.png'));
       }
 
-      if (files.length === 0) {
-        throw new Error(`Timecut terminó pero la carpeta ${framesDir} está vacía. Intenta bajar la resolución.`);
+      if (files.length < expectedFrames - 5) { // Tolerancia de 5 frames
+        throw new Error(`Render incompleto: ${files.length}/${expectedFrames} frames.`);
       }
 
-      // Ordenamos para ver el primero
-      files.sort();
-      const firstFile = files[0]; // Ejemplo: "image-1.png" o "image-000000001.png"
-      console.log(`[Job ${jobId}] Primer archivo encontrado: ${firstFile}`);
-
-      // 3. DECISIÓN DINÁMICA DE PATRÓN
-      // Timecut por defecto suele usar image-1.png (sin ceros) O image-000001.png
-      // Vamos a construir el input de FFmpeg basándonos en lo que vemos.
-      
-      let ffmpegInput = "";
-      
-      // Si el archivo tiene ceros a la izquierda (ej: image-001.png)
-      if (firstFile.match(/image-0+\d+.png/)) {
-        // Contamos cuántos dígitos tiene
-        const digits = firstFile.match(/\d+/)[0].length;
-        ffmpegInput = path.join(framesDir, `image-%0${digits}d.png`);
-      } 
-      // Si el archivo es simple (ej: image-1.png)
-      else {
-        ffmpegInput = path.join(framesDir, 'image-%d.png');
-      }
-
-      console.log(`[Job ${jobId}] Usando patrón FFmpeg: ${ffmpegInput}`);
-
-      // 4. GENERACIÓN GIF ALTA CALIDAD
-      const ffmpegCmd = `ffmpeg -f image2 -framerate ${safeFps} -i "${ffmpegInput}" -vf "split[s0][s1];[s0]palettegen[p];[s1][p]paletteuse" -loop 0 "${outputGif}"`;
+      // 6. GENERACIÓN GIF
+      const framesPattern = path.join(framesDir, 'image-%09d.png');
+      const ffmpegCmd = `ffmpeg -f image2 -framerate ${safeFps} -i "${framesPattern}" -vf "split[s0][s1];[s0]palettegen[p];[s1][p]paletteuse" -loop 0 "${outputGif}"`;
 
       execSync(ffmpegCmd);
 
@@ -142,17 +156,18 @@ app.post('/start', async (req, res) => {
       if (fs.existsSync(outputGif)) {
         sendEvent(jobId, { status: 'completed', url: `/download/${jobId}` });
       } else {
-        throw new Error('FFmpeg no generó el GIF final.');
+        throw new Error('Fallo en la compresión final.');
       }
 
     } catch (error) {
-      console.error("Error Job:", error);
+      console.error(`[Job ${jobId}] Error:`, error.message);
       sendEvent(jobId, { status: 'error', message: error.message });
       try { fs.rmSync(jobDir, { recursive: true, force: true }); } catch(e){}
     }
   })();
 });
 
+// Endpoints GET (events / download) se mantienen igual...
 app.get('/events/:jobId', (req, res) => {
   const { jobId } = req.params;
   res.setHeader('Content-Type', 'text/event-stream');
@@ -177,4 +192,4 @@ app.get('/download/:jobId', (req, res) => {
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Worker V5.3 (Detective Mode) listo en ${PORT}`));
+app.listen(PORT, () => console.log(`Worker V8 (Guardian Mode) listo en ${PORT}`));
