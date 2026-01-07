@@ -29,11 +29,13 @@ app.post('/start', async (req, res) => {
     console.error("FFmpeg no encontrado");
     return res.status(500).json({ error: "Server misconfiguration: FFmpeg missing" });
   }
+  
   res.json({ jobId });
 
   (async () => {
+    // Definimos rutas
     const jobDir = path.join(os.tmpdir(), `job-${jobId}`);
-    const framesDir = path.join(jobDir, 'frames');
+    const framesDir = path.join(jobDir, 'frames'); // Aquí van las fotos
     const tempHtml = path.join(jobDir, 'input.html');
     const outputGif = path.join(jobDir, 'output.gif');
 
@@ -44,9 +46,11 @@ app.post('/start', async (req, res) => {
     const safeBg = bg || 'transparent'; 
 
     try {
+      // 1. Crear carpetas
       if (!fs.existsSync(jobDir)) fs.mkdirSync(jobDir);
       if (!fs.existsSync(framesDir)) fs.mkdirSync(framesDir);
 
+      // 2. HTML + CSS Inyectado
       const fullContent = `
         <!DOCTYPE html>
         <html>
@@ -80,35 +84,39 @@ app.post('/start', async (req, res) => {
         }
       };
 
-      // 1. CAPTURA
+      // 3. CAPTURA DE FRAMES
       await timecut({
         url: `file://${tempHtml}`,
         viewport: { width: safeWidth, height: safeHeight },
         duration: safeDuration,
         fps: safeFps,
-        tempDir: framesDir,
+        tempDir: framesDir,     // Usar nuestra carpeta
+        keepFrames: true,       // <--- ¡LA SOLUCIÓN! (No borrar fotos al terminar)
         logger: customLogger,
         launchArguments: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-gpu'],
-        output: '', 
-        // CORRECCIÓN 1: Forzamos el nombre del archivo para estar seguros
-        screenshotPattern: 'image-%d.png' 
+        output: '',             // No generar video aquí
+        screenshotPattern: 'image-%d.png' // Nombre simple: image-1.png, image-2.png
       });
 
       sendEvent(jobId, { status: 'processing', progress: 85 });
       
-      // DIAGNÓSTICO: Listar archivos para ver si timecut hizo su trabajo
+      // DIAGNÓSTICO
       console.log(`[Job ${jobId}] Verificando frames en ${framesDir}...`);
-      const files = fs.readdirSync(framesDir);
-      console.log(`Archivos encontrados (primeros 5):`, files.slice(0, 5));
-
-      if (files.length === 0) throw new Error("Timecut no generó ningún frame.");
+      if (fs.existsSync(framesDir)) {
+        const files = fs.readdirSync(framesDir);
+        console.log(`Archivos encontrados: ${files.length}`);
+        if (files.length === 0) throw new Error("Timecut no generó imágenes.");
+      } else {
+        throw new Error("La carpeta frames desapareció (keepFrames falló).");
+      }
 
       console.log(`[Job ${jobId}] Iniciando FFmpeg High Quality...`);
 
-      // 2. FFMPEG
-      // CORRECCIÓN 2: Cambiamos %09d por %d para que acepte "image-1.png", "image-10.png", etc.
+      // 4. FFMPEG MANUAL
+      // Usamos %d para coincidir con image-1.png, image-2.png...
       const framesPattern = path.join(framesDir, 'image-%d.png');
       
+      // Comando palettegen para máxima calidad de color
       const ffmpegCmd = `ffmpeg -f image2 -framerate ${safeFps} -i "${framesPattern}" -vf "split[s0][s1];[s0]palettegen[p];[s1][p]paletteuse" -loop 0 "${outputGif}"`;
 
       execSync(ffmpegCmd);
@@ -118,12 +126,13 @@ app.post('/start', async (req, res) => {
       if (fs.existsSync(outputGif)) {
         sendEvent(jobId, { status: 'completed', url: `/download/${jobId}` });
       } else {
-        throw new Error('Error al generar el archivo final');
+        throw new Error('FFmpeg terminó pero no creó el GIF.');
       }
 
     } catch (error) {
       console.error("Error Job:", error);
       sendEvent(jobId, { status: 'error', message: error.message });
+      // Limpieza SOLO si hay error grave
       try { fs.rmSync(jobDir, { recursive: true, force: true }); } catch(e){}
     }
   })();
@@ -145,6 +154,7 @@ app.get('/download/:jobId', (req, res) => {
   
   if (fs.existsSync(filePath)) {
     res.download(filePath, 'banner.gif', () => {
+      // Limpieza FINAL exitosa
       const jobDir = path.join(os.tmpdir(), `job-${jobId}`);
       try { fs.rmSync(jobDir, { recursive: true, force: true }); } catch(e){}
     });
@@ -154,4 +164,4 @@ app.get('/download/:jobId', (req, res) => {
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Worker V5.1 (Pattern Fix) listo en puerto ${PORT}`));
+app.listen(PORT, () => console.log(`Worker V5.2 (KeepFrames) listo en ${PORT}`));
