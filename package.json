@@ -10,6 +10,7 @@
   "license": "ISC",
   "description": "",
   "dependencies": {
+    "cors": "^2.8.5",
     "express": "^5.2.1",
     "puppeteer": "^24.34.0",
     "timecut": "^0.3.3"
