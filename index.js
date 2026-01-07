@@ -23,21 +23,17 @@ app.post('/start', async (req, res) => {
   const { html, css, width, height, duration, bg, fps } = req.body;
   const jobId = Date.now().toString();
 
-  try {
-    execSync('ffmpeg -version');
-  } catch (e) {
-    console.error("FFmpeg no encontrado");
-    return res.status(500).json({ error: "Server misconfiguration: FFmpeg missing" });
-  }
-  
   res.json({ jobId });
 
   (async () => {
-    // Definimos rutas
+    // Configuración de rutas
     const jobDir = path.join(os.tmpdir(), `job-${jobId}`);
-    const framesDir = path.join(jobDir, 'frames'); // Aquí van las fotos
+    const framesDir = path.join(jobDir, 'frames');
     const tempHtml = path.join(jobDir, 'input.html');
     const outputGif = path.join(jobDir, 'output.gif');
+    
+    // Archivo basura para que timecut no se queje
+    const dummyOutput = path.join(jobDir, 'dummy.mp4'); 
 
     const safeFps = parseInt(fps || 30); 
     const safeWidth = makeEven(parseInt(width || 800));
@@ -46,11 +42,10 @@ app.post('/start', async (req, res) => {
     const safeBg = bg || 'transparent'; 
 
     try {
-      // 1. Crear carpetas
       if (!fs.existsSync(jobDir)) fs.mkdirSync(jobDir);
       if (!fs.existsSync(framesDir)) fs.mkdirSync(framesDir);
 
-      // 2. HTML + CSS Inyectado
+      // Inyección CSS
       const fullContent = `
         <!DOCTYPE html>
         <html>
@@ -84,40 +79,61 @@ app.post('/start', async (req, res) => {
         }
       };
 
-      // 3. CAPTURA DE FRAMES
+      console.log(`[Job ${jobId}] Iniciando captura Timecut...`);
+
+      // 1. CAPTURA (Sin forzar pattern, dejamos el default)
       await timecut({
         url: `file://${tempHtml}`,
         viewport: { width: safeWidth, height: safeHeight },
         duration: safeDuration,
         fps: safeFps,
-        tempDir: framesDir,     // Usar nuestra carpeta
-        keepFrames: true,       // <--- ¡LA SOLUCIÓN! (No borrar fotos al terminar)
+        tempDir: framesDir,     
+        keepFrames: true,       // OBLIGATORIO
         logger: customLogger,
         launchArguments: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-gpu'],
-        output: '',             // No generar video aquí
-        screenshotPattern: 'image-%d.png' // Nombre simple: image-1.png, image-2.png
+        output: dummyOutput,    // Le damos un output dummy para asegurar que termine el proceso bien
       });
 
       sendEvent(jobId, { status: 'processing', progress: 85 });
       
-      // DIAGNÓSTICO
-      console.log(`[Job ${jobId}] Verificando frames en ${framesDir}...`);
+      // 2. DETECTIVE DE ARCHIVOS (Aquí estaba el error antes)
+      console.log(`[Job ${jobId}] Analizando frames generados...`);
+      
+      let files = [];
       if (fs.existsSync(framesDir)) {
-        const files = fs.readdirSync(framesDir);
-        console.log(`Archivos encontrados: ${files.length}`);
-        if (files.length === 0) throw new Error("Timecut no generó imágenes.");
-      } else {
-        throw new Error("La carpeta frames desapareció (keepFrames falló).");
+        files = fs.readdirSync(framesDir).filter(f => f.endsWith('.png'));
       }
 
-      console.log(`[Job ${jobId}] Iniciando FFmpeg High Quality...`);
+      if (files.length === 0) {
+        throw new Error(`Timecut terminó pero la carpeta ${framesDir} está vacía. Intenta bajar la resolución.`);
+      }
 
-      // 4. FFMPEG MANUAL
-      // Usamos %d para coincidir con image-1.png, image-2.png...
-      const framesPattern = path.join(framesDir, 'image-%d.png');
+      // Ordenamos para ver el primero
+      files.sort();
+      const firstFile = files[0]; // Ejemplo: "image-1.png" o "image-000000001.png"
+      console.log(`[Job ${jobId}] Primer archivo encontrado: ${firstFile}`);
+
+      // 3. DECISIÓN DINÁMICA DE PATRÓN
+      // Timecut por defecto suele usar image-1.png (sin ceros) O image-000001.png
+      // Vamos a construir el input de FFmpeg basándonos en lo que vemos.
       
-      // Comando palettegen para máxima calidad de color
-      const ffmpegCmd = `ffmpeg -f image2 -framerate ${safeFps} -i "${framesPattern}" -vf "split[s0][s1];[s0]palettegen[p];[s1][p]paletteuse" -loop 0 "${outputGif}"`;
+      let ffmpegInput = "";
+      
+      // Si el archivo tiene ceros a la izquierda (ej: image-001.png)
+      if (firstFile.match(/image-0+\d+.png/)) {
+        // Contamos cuántos dígitos tiene
+        const digits = firstFile.match(/\d+/)[0].length;
+        ffmpegInput = path.join(framesDir, `image-%0${digits}d.png`);
+      } 
+      // Si el archivo es simple (ej: image-1.png)
+      else {
+        ffmpegInput = path.join(framesDir, 'image-%d.png');
+      }
+
+      console.log(`[Job ${jobId}] Usando patrón FFmpeg: ${ffmpegInput}`);
+
+      // 4. GENERACIÓN GIF ALTA CALIDAD
+      const ffmpegCmd = `ffmpeg -f image2 -framerate ${safeFps} -i "${ffmpegInput}" -vf "split[s0][s1];[s0]palettegen[p];[s1][p]paletteuse" -loop 0 "${outputGif}"`;
 
       execSync(ffmpegCmd);
 
@@ -126,13 +142,12 @@ app.post('/start', async (req, res) => {
       if (fs.existsSync(outputGif)) {
         sendEvent(jobId, { status: 'completed', url: `/download/${jobId}` });
       } else {
-        throw new Error('FFmpeg terminó pero no creó el GIF.');
+        throw new Error('FFmpeg no generó el GIF final.');
       }
 
     } catch (error) {
       console.error("Error Job:", error);
       sendEvent(jobId, { status: 'error', message: error.message });
-      // Limpieza SOLO si hay error grave
       try { fs.rmSync(jobDir, { recursive: true, force: true }); } catch(e){}
     }
   })();
@@ -151,10 +166,8 @@ app.get('/events/:jobId', (req, res) => {
 app.get('/download/:jobId', (req, res) => {
   const { jobId } = req.params;
   const filePath = path.join(os.tmpdir(), `job-${jobId}`, 'output.gif');
-  
   if (fs.existsSync(filePath)) {
     res.download(filePath, 'banner.gif', () => {
-      // Limpieza FINAL exitosa
       const jobDir = path.join(os.tmpdir(), `job-${jobId}`);
       try { fs.rmSync(jobDir, { recursive: true, force: true }); } catch(e){}
     });
@@ -164,4 +177,4 @@ app.get('/download/:jobId', (req, res) => {
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Worker V5.2 (KeepFrames) listo en ${PORT}`));
+app.listen(PORT, () => console.log(`Worker V5.3 (Detective Mode) listo en ${PORT}`));
