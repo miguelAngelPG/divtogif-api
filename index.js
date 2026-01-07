@@ -2,19 +2,22 @@ const express = require('express');
 const timecut = require('timecut');
 const fs = require('fs');
 const path = require('path');
-const cors = require('cors'); // Para permitir que tu Next.js le hable
+const os = require('os'); // Importamos os
+const cors = require('cors');
 
 const app = express();
-app.use(express.json({ limit: '10mb' })); // Aumentamos límite para recibir HTML grande
+app.use(express.json({ limit: '10mb' }));
 app.use(cors());
 
 app.post('/render', async (req, res) => {
   const { html, css, width, height, duration } = req.body;
+  
+  // USAMOS LA CARPETA TEMPORAL DEL SISTEMA (/tmp)
   const id = Date.now();
-  const tempHtml = path.join(__dirname, `${id}.html`);
-  const outputGif = path.join(__dirname, `${id}.gif`);
+  const tempDir = os.tmpdir(); 
+  const tempHtml = path.join(tempDir, `${id}.html`);
+  const outputGif = path.join(tempDir, `${id}.gif`);
 
-  // 1. Preparamos el HTML completo
   const fullContent = `
     <!DOCTYPE html>
     <html>
@@ -29,33 +32,48 @@ app.post('/render', async (req, res) => {
   `;
 
   try {
+    // 1. Escribimos el HTML en /tmp
     fs.writeFileSync(tempHtml, fullContent);
 
     console.log(`Iniciando render ${id}...`);
 
-    // 2. Renderizamos (Aquí es donde Railway brilla y Vercel muere)
     await timecut({
       url: `file://${tempHtml}`,
       output: outputGif,
-      viewport: { width: parseInt(width), height: parseInt(height) },
-      duration: parseInt(duration),
-      fps: 30, // 30 es un buen balance calidad/peso
+      viewport: { width: parseInt(width || 800), height: parseInt(height || 400) },
+      duration: parseInt(duration || 3),
+      fps: 30,
+      // CRUCIAL: Le decimos a timecut que use /tmp para sus archivos internos
+      tempDir: tempDir, 
       launchArguments: [
         '--no-sandbox', 
         '--disable-setuid-sandbox',
-        '--disable-dev-shm-usage' // Importante para Docker
+        '--disable-dev-shm-usage',
+        '--disable-gpu' // Agregado por seguridad
       ]
     });
 
-    // 3. Enviamos el archivo de vuelta
-    res.download(outputGif, 'banner.gif', (err) => {
-      if (err) console.error(err);
-      // Limpieza
-      try { fs.unlinkSync(tempHtml); fs.unlinkSync(outputGif); } catch(e){}
-    });
+    // 2. Verificamos que el archivo existe antes de enviarlo
+    if (fs.existsSync(outputGif)) {
+      res.download(outputGif, 'banner.gif', (err) => {
+        if (err) console.error("Error al enviar:", err);
+        // Limpieza
+        try { 
+          if(fs.existsSync(tempHtml)) fs.unlinkSync(tempHtml); 
+          if(fs.existsSync(outputGif)) fs.unlinkSync(outputGif); 
+        } catch(e) { console.error("Error limpiando:", e); }
+      });
+    } else {
+      throw new Error("El archivo GIF no se generó correctamente.");
+    }
 
   } catch (error) {
     console.error("Error renderizando:", error);
+    // Limpieza en caso de error
+    try { 
+        if(fs.existsSync(tempHtml)) fs.unlinkSync(tempHtml); 
+    } catch(e) {}
+    
     res.status(500).json({ error: error.message });
   }
 });
