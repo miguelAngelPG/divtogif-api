@@ -1,10 +1,9 @@
 # Usamos una imagen ligera de Node (Debian)
 FROM node:18-slim
 
-# 1. Instalamos las librerías necesarias para correr Chrome en Linux
-# Esto descarga Google Chrome Stable oficial y sus dependencias
+# 1. Instalamos Chrome, dependencias Y FFMPEG (¡Nuevo!)
 RUN apt-get update \
-    && apt-get install -y wget gnupg \
+    && apt-get install -y wget gnupg ffmpeg \
     && wget -q -O - https://dl-ssl.google.com/linux/linux_signing_key.pub | gpg --dearmor -o /usr/share/keyrings/googlechrome-linux-keyring.gpg \
     && sh -c 'echo "deb [arch=amd64 signed-by=/usr/share/keyrings/googlechrome-linux-keyring.gpg] http://dl.google.com/linux/chrome/deb/ stable main" >> /etc/apt/sources.list.d/google.list' \
     && apt-get update \
@@ -17,14 +16,12 @@ WORKDIR /usr/src/app
 
 # 3. Instalamos dependencias de Node
 COPY package*.json ./
-# npm ci es más rápido y seguro para entornos de producción
 RUN npm ci
 
 # 4. Copiamos el código
 COPY . .
 
-# 5. Variables de entorno CRUCIALES
-# Le decimos a Puppeteer: "No descargues tu Chrome, usa el que instalé yo arriba"
+# 5. Variables de entorno
 ENV PUPPETEER_SKIP_CHROMIUM_DOWNLOAD=true \
     PUPPETEER_EXECUTABLE_PATH=/usr/bin/google-chrome-stable
 
