@@ -1,0 +1,17 @@
+{
+  "name": "gif-worker",
+  "version": "1.0.0",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "description": "",
+  "dependencies": {
+    "express": "^5.2.1",
+    "puppeteer": "^24.34.0",
+    "timecut": "^0.3.3"
+  }
+}
